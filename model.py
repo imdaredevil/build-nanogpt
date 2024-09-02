@@ -24,12 +24,13 @@ class CausualSelfAttention(nn.Module):
         q = q.view(-1, x.shape[1], self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(-1, x.shape[1], self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(-1, x.shape[1], self.n_head, self.head_dim).transpose(1, 2)
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        # scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         # mask out future tokens
-        mask = torch.tril(torch.ones((x.shape[1], x.shape[1]))).view(1, 1, x.shape[1], x.shape[1])
-        scores = scores.masked_fill(mask == 0, -np.inf)
-        scores = F.softmax(scores, dim = -1)
-        scores = torch.matmul(scores, v)
+        mask = torch.tril(torch.ones((x.shape[1], x.shape[1]))).view(1, 1, x.shape[1], x.shape[1]).to(self.c_proj.weight.device)
+        scores = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        # scores = scores.masked_fill(mask == 0, -np.inf)
+        # scores = F.softmax(scores, dim = -1)
+        # scores = torch.matmul(scores, v)
         scores = scores.transpose(1, 2).contiguous().view(-1, x.shape[1], self.n_embd)
         return self.c_proj(scores)
 
