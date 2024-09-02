@@ -86,12 +86,14 @@ for step, (x, y) in enumerate(data_loader):
     # backward pass
     optimizer.zero_grad()
     loss_value.backward()
+    # clip gradients
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
     if device == "mps":
         torch.mps.synchronize()
     end = time.time()
     time_taken = end - st
-    print(f"Step: {step}, loss: {loss_value.item():.4f}, time taken: {time_taken * 1000:.4f} ms, tokens per second: {(BATCH_SIZE * NUM_TOKENS/time_taken):.4f}")
+    print(f"Step: {step}, loss: {loss_value.item():.4f}, norm: {norm:.4f}, time taken: {time_taken * 1000:.4f} ms, tokens per second: {(BATCH_SIZE * NUM_TOKENS/time_taken):.4f}")
 
 torch.save(model.state_dict(), "model.pt")
 model.state_dict()
