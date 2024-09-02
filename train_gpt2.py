@@ -15,7 +15,7 @@ model = GPT2(config)
 
 EPOCHS = 1
 BATCH_SIZE = 16
-MINI_BATCH_SIZE = 8 # we use gradient accumulation here.
+MINI_BATCH_SIZE = 8  # we use gradient accumulation here.
 NUM_TOKENS = 16
 MAX_STEPS = 50
 assert BATCH_SIZE % MINI_BATCH_SIZE == 0
@@ -36,10 +36,10 @@ class Dataloader:
 
     def __len__(self):
         return self.num_batches
-    
+
     def __iter__(self):
         return self
-    
+
     def __next__(self):
         batch_token_size = self.batch_size * self.num_tokens
         if (self.curr_index + batch_token_size) >= len(self.dataset_tokens):
