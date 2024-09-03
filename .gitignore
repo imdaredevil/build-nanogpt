@@ -1,2 +1,4 @@
 *.parquet
-*pt
+*.pt
+*.npy
+*.pyc
