@@ -7,23 +7,56 @@ from torch.optim import AdamW
 import time
 import os
 import numpy as np
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
+import torch.distributed as dist
+import inspect
 
 torch.manual_seed(42)
+
+ddp = int(os.environ.get('RANK', -1)) != -1 # check whether using ddp
+if ddp:
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    device = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(device)
+else:
+    ddp_world_size = 1
+    ddp_rank = 0
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    # device = "cpu"
+is_main_process = (ddp_rank == 0)
+if is_main_process:
+    print(f"using device: {device}")
+device_type = "cuda" if device.startswith("cuda") else "cpu"
+
 
 encoder = tiktoken.encoding_for_model("gpt2")
 eot = encoder._special_tokens['<|endoftext|>']
 config = GPT2Config(vocab_size=50304)
 model = GPT2(config)
+model.to(device)
 model = torch.compile(model)
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+
 
 EPOCHS = 1
-BATCH_SIZE = 64
+BATCH_SIZE = 512
 MINI_BATCH_SIZE = 16 # we use gradient accumulation here.
 NUM_TOKENS = 1024
 MAX_STEPS = 50
-assert BATCH_SIZE % MINI_BATCH_SIZE == 0
-GRAD_ACCUM_STEPS = BATCH_SIZE // MINI_BATCH_SIZE
-print(f"grad accumulation steps: {GRAD_ACCUM_STEPS}")
+assert BATCH_SIZE % (MINI_BATCH_SIZE * ddp_world_size ) == 0
+GRAD_ACCUM_STEPS = BATCH_SIZE // (MINI_BATCH_SIZE * ddp_world_size)
+if is_main_process:
+    print(f"grad accumulation steps: {GRAD_ACCUM_STEPS}")
 # creating dataloader
 
 class Dataloader:
@@ -40,7 +73,7 @@ class Dataloader:
         return self
 
     def __next__(self):
-        batch_token_size = self.batch_size * self.num_tokens + 1
+        batch_token_size = self.batch_size * self.num_tokens * ddp_world_size + 1
         tokens = self.curr_shard_tokens[self.curr_index : self.curr_index + batch_token_size]
 
         if len(tokens) < batch_token_size: # need to fetch from next shard
@@ -58,6 +91,8 @@ class Dataloader:
             self.curr_index = batch_token_size - len(tokens) - 1
         else:
             self.curr_index += batch_token_size - 1
+        curr_device_batch_size = self.batch_size * self.num_tokens
+        tokens = tokens[ddp_local_rank * curr_device_batch_size:((ddp_local_rank + 1) * curr_device_batch_size + 1)]
         x = tokens[:-1]
         y = tokens[1:]
         x = torch.tensor(x, dtype=torch.long).view(self.batch_size, self.num_tokens)
@@ -80,25 +115,19 @@ class Dataloader:
 FINEWEB_PATH = "data/fineweb/"
 NUM_TOKEN_TOTAL = int(1e10)
 NUM_BATCHES = NUM_TOKEN_TOTAL // (BATCH_SIZE * NUM_TOKENS)
-print(f"Number of steps: {NUM_BATCHES}")
+if is_main_process:
+    print(f"Number of steps: {NUM_BATCHES}")
 data_loader = Dataloader(FINEWEB_PATH, MINI_BATCH_SIZE, NUM_TOKENS, eot)
 NUM_BATCHES = 50
-
-
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
-# device = "cpu"
-print(f"using device: {device}")
-
-model.to(device)
 
 # loss and optimizer
 loss = CrossEntropyLoss()
 loss.to(device)
-optimizer = AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95))
+fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+use_fused = fused_available and device_type == "cuda"
+if is_main_process:
+    print(f"Fused param in optimizer: {use_fused}")
+optimizer = AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), fused=use_fused)
 MAX_LR = 6e-4
 WARMUP_STEPS = 24 # this we calculated from gpt 3 paper. There they use first 375 M token for a 300 B token dataset.
 COSINE_DECAY_STEPS = 16530 # again in GPT3 they use first 260B tokens out of 300B dataset. 
@@ -122,32 +151,36 @@ def get_lr(curr_lr, step):
 # training loop
 lr = 0
 for epoch in range(EPOCHS):
-    print(f"Epoch: {epoch}")
+    if is_main_process:
+        print(f"Epoch: {epoch}")
     data_loader_iterator = iter(data_loader)
     for step in range(NUM_BATCHES):
         if step >= MAX_STEPS:
             break
         st = time.time()
         # forward pass
-        loss_scalar = 0
+        loss_scalar = 0.0
         lr = get_lr(lr, step)
         optimizer.param_groups[0]["lr"] = lr
         optimizer.zero_grad()
-        for _ in range(GRAD_ACCUM_STEPS):
+        for mini_step in range(GRAD_ACCUM_STEPS):
             try:
                 x, y = next(data_loader_iterator)
             except StopIteration:
-                print("looping back")
                 pass  # end of iterator. looping back to start
             x = x.to(device)
             y = y.to(device)
-            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            if ddp:
+                model.require_backward_grad_sync = (mini_step == GRAD_ACCUM_STEPS - 1)# sync gradients only in the last mini step
+            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                 logits = model(x)
                 loss_value = loss(logits.view(logits.shape[0] * logits.shape[1], logits.shape[-1]), y.view(y.shape[-1] * y.shape[-2]))
                 loss_value /= GRAD_ACCUM_STEPS
             # backward pass
             loss_value.backward()
-            loss_scalar += loss_value.item()
+            loss_scalar += loss_value
+        if ddp:
+            dist.all_reduce(loss_value, op=dist.ReduceOp.AVG)
 
         # clip gradients
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -158,6 +191,9 @@ for epoch in range(EPOCHS):
             torch.cuda.synchronize()
         end = time.time()
         time_taken = end - st
-        print(f"Step: {step}, loss: {loss_scalar:.4f}, norm: {norm:.4f}, lr: {lr:.4e}, time taken: {time_taken * 1000:.4f} ms, tokens per second: {(BATCH_SIZE * NUM_TOKENS/time_taken):.4f}")
-
-torch.save(model.state_dict(), "model.pt")
+        if is_main_process:
+            print(f"Step: {step}, loss: {loss_scalar:.4f}, norm: {norm:.4f}, lr: {lr:.4e}, time taken: {time_taken * 1000:.4f} ms, tokens per second: {(BATCH_SIZE * NUM_TOKENS/time_taken):.4f}")
+if ddp:
+    destroy_process_group()
+if is_main_process:
+    torch.save(model.state_dict(), "model.pt")
