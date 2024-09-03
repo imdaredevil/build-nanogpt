@@ -13,6 +13,7 @@ from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
 import torch.nn.functional as F
 import inspect
+import matplotlib.pyplot as plt
 
 torch.manual_seed(42)
 if torch.cuda.is_available():
@@ -29,6 +30,7 @@ if ddp:
 else:
     ddp_world_size = 1
     ddp_rank = 0
+    ddp_local_rank = 0
     device = "cpu"
     if torch.cuda.is_available():
         device = "cuda"
@@ -46,27 +48,38 @@ eot = encoder._special_tokens['<|endoftext|>']
 config = GPT2Config(vocab_size=50304)
 model = GPT2(config)
 model.to(device)
-model = torch.compile(model)
+if device != "mps":
+    model = torch.compile(model)
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
 
 EPOCHS = 1
-BATCH_SIZE = 512
-MINI_BATCH_SIZE = 8 # we use gradient accumulation here.
-NUM_TOKENS = 1024
+BATCH_SIZE = 16
+MINI_BATCH_SIZE = 4 # we use gradient accumulation here.
+NUM_TOKENS = 128
 MAX_STEPS = 50
+VAL_STEPS = 20
 VAL_FREQUENCY = 200
 SAMPLE_FREQUENCY = 20
 sample_start = "I am a large language model. "
 sample_start_tokens = encoder.encode(sample_start)
-sample_start_tokens = np.array(sample_start_tokens, dtype=np.uint16)
-sample_start_tokens = torch.tensor(sample_start_tokens, device=device).unsqueeze(0)
+sample_start_tokens = np.array(sample_start_tokens, dtype=np.int32)
+sample_start_tokens = torch.tensor(sample_start_tokens, device=device)
+NUM_SAMPLES = 5
+sample_start_tokens = torch.stack([ sample_start_tokens for _ in range(NUM_SAMPLES)], dim=0)
+MAX_SAMPLE_LENGTH = 20
+SAVE_FREQUENCY = 20
+CHECKPOINT_DIR = "./checkpoints"
+LOG_FREQUENCY = 10
+LOG_FILE = "./train.log"
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 assert BATCH_SIZE % (MINI_BATCH_SIZE * ddp_world_size ) == 0
 GRAD_ACCUM_STEPS = BATCH_SIZE // (MINI_BATCH_SIZE * ddp_world_size)
 if is_main_process:
     print(f"grad accumulation steps: {GRAD_ACCUM_STEPS}")
 # creating dataloader
+
 
 class Dataloader:
     def __init__(self, folder_path, batch_size, num_tokens, pad_token, split = "train"):
@@ -105,8 +118,8 @@ class Dataloader:
         tokens = tokens[ddp_local_rank * curr_device_batch_size:((ddp_local_rank + 1) * curr_device_batch_size + 1)]
         x = tokens[:-1]
         y = tokens[1:]
-        x = torch.tensor(x, dtype=torch.long).view(self.batch_size, self.num_tokens)
-        y = torch.tensor(y, dtype=torch.long).view(self.batch_size, self.num_tokens)
+        x = torch.tensor(x.astype(np.int32)).view(self.batch_size, self.num_tokens)
+        y = torch.tensor(y.astype(np.int32)).view(self.batch_size, self.num_tokens)
         return x, y
 
     def reset(self):
@@ -157,9 +170,57 @@ def get_lr(curr_lr, step):
         return MIN_LR
 
 
+def val_model():
+    model.eval()
+    with torch.no_grad():
+        val_data_loader.reset()
+        val_data_loader_iterator = iter(val_data_loader)
+        val_loss_scalar = 0.0
+        num_val_batches = 0
+        for _ in range(20):
+            x, y = next(val_data_loader_iterator)
+            x = x.to(device)
+            y = y.to(device)
+            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                logits = model(x)
+                loss_value = loss(logits.view(logits.shape[0] * logits.shape[1], logits.shape[-1]), y.view(y.shape[-1] * y.shape[-2]))
+                val_loss_scalar += loss_value
+            num_val_batches += 1
+        val_loss_scalar /= num_val_batches
+        if ddp:
+            dist.all_reduce(val_loss_scalar, op=dist.ReduceOp.AVG)
+        return val_loss_scalar
+
+
+def sample_model():
+    """create samples from model using topk = 50"""
+    model.eval()
+    sample_sentences = []
+    with torch.no_grad():
+        # stacking sample start tokens
+        curr_sample_start_tokens = sample_start_tokens.view(*sample_start_tokens.shape).to(device)
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            for _ in range(MAX_SAMPLE_LENGTH):
+                logits = model(curr_sample_start_tokens)
+                logits = logits[:, -1, :]
+                probs = torch.nn.functional.softmax(logits, dim=-1)
+                topk = probs.topk(50)
+                tokens, probability = topk.indices, topk.values
+                next_token = torch.multinomial(probability, num_samples=1)
+                next_token = tokens.gather(dim=-1, index=next_token)
+                # update sample start tokens
+                curr_sample_start_tokens = torch.cat((curr_sample_start_tokens, next_token), dim=1)
+            for i in range(curr_sample_start_tokens.shape[0]):
+                sample_sentences.append(encoder.decode(curr_sample_start_tokens[i].cpu().numpy().tolist()))
+    return sample_sentences
 
 # training loop
 lr = 0
+logs = []
+train_losses = []
+val_losses = []
+f = open(LOG_FILE, "w")
+f.close()
 for epoch in range(EPOCHS):
     if is_main_process:
         print(f"Epoch: {epoch}")
@@ -168,33 +229,31 @@ for epoch in range(EPOCHS):
         model.eval()
         if step >= MAX_STEPS:
             break
-        with torch.no_grad():
-            if step % VAL_FREQUENCY == 0:
-                val_data_loader.reset()
-                val_data_loader_iterator = iter(val_data_loader)
-                val_loss_scalar = 0.0
-                num_val_batches = 0
-                for _ in range(20):
-                    x,y = next(val_data_loader_iterator)
-                    x = x.to(device)
-                    y = y.to(device)
-                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                        logits = model(x)
-                        loss_value = loss(logits.view(logits.shape[0] * logits.shape[1], logits.shape[-1]), y.view(y.shape[-1] * y.shape[-2]))
-                        val_loss_scalar += loss_value
-                    num_val_batches += 1
-                val_loss_scalar /= num_val_batches
-                if ddp:
-                    dist.all_reduce(val_loss_scalar, op=dist.ReduceOp.AVG)
-                val_loss_scalar = val_loss_scalar.item()
-                if is_main_process:
-                    print(f"Validation loss: {val_loss_scalar:.4f} at step {step}")
-            if step % SAMPLE_FREQUENCY == 0:
-                if is_main_process:
-                    x = x.to(device)
-                    logits = model(x)
-                    
-
+        if step % VAL_FREQUENCY == 0:
+            val_loss_scalar = val_model()
+            if is_main_process:
+                log_str = f"Validation loss: {val_loss_scalar:.4f} at step {step}"
+                logs.append(log_str)
+                print(log_str)
+        if step % SAMPLE_FREQUENCY == 0:
+            if is_main_process:
+                print(f"Sampling at step {step}")
+                samples = sample_model()
+                for sample in samples:
+                    print(sample)
+        if step % SAVE_FREQUENCY == 0:
+            if is_main_process:
+                torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/model_{step}.pt")
+        if step % LOG_FREQUENCY == 0:
+            if is_main_process:
+                with open(LOG_FILE, "a") as f:
+                    f.write("\n".join(logs))
+                logs = []
+                plt.figure()
+                plt.plot(train_losses)
+                plt.plot(val_losses)
+                plt.legend(["train", "val"])
+                plt.savefig(f"{CHECKPOINT_DIR}/losses_{step}.png")
         model.train()
         st = time.time()
         # forward pass
@@ -219,7 +278,7 @@ for epoch in range(EPOCHS):
             loss_value.backward()
             loss_scalar += loss_value
         if ddp:
-            dist.all_reduce(loss_value, op=dist.ReduceOp.AVG)
+            dist.all_reduce(loss_scalar, op=dist.ReduceOp.AVG)
 
         # clip gradients
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -231,8 +290,38 @@ for epoch in range(EPOCHS):
         end = time.time()
         time_taken = end - st
         if is_main_process:
-            print(f"Step: {step}, loss: {loss_scalar:.4f}, norm: {norm:.4f}, lr: {lr:.4e}, time taken: {time_taken * 1000:.4f} ms, tokens per second: {(BATCH_SIZE * NUM_TOKENS/time_taken):.4f}")
+            log_str = f"Step: {step}, loss: {loss_scalar.item():.4f}, norm: {norm:.4f}, lr: {lr:.4e}, time taken: {time_taken * 1000:.4f} ms, tokens per second: {(BATCH_SIZE * NUM_TOKENS/time_taken):.4f}"
+            logs.append(log_str)
+            print(log_str)
+            train_losses.append(loss_scalar.item())
+            val_losses.append(val_loss_scalar.item())
+
 if ddp:
     destroy_process_group()
+
+# final validation
+val_loss_scalar = val_model()
 if is_main_process:
-    torch.save(model.state_dict(), "model.pt")
+    log_str = f"Final validation loss: {val_loss_scalar:.4f}"
+    logs.append(log_str)
+    print(log_str)
+    val_losses.append(val_loss_scalar.item())
+
+# final sample
+if is_main_process:
+    samples = sample_model()
+    for sample in samples:
+        print(sample)
+
+# save model
+if is_main_process:
+    torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/model.pt")
+
+# save logs
+with open(LOG_FILE, "a") as f:
+    f.write("\n".join(logs))
+plt.figure()
+plt.plot(train_losses)
+plt.plot(val_losses)
+plt.legend(["train", "val"])
+plt.savefig(f"{CHECKPOINT_DIR}/losses.png")
