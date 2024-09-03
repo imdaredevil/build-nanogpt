@@ -11,9 +11,12 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
+import torch.nn.functional as F
 import inspect
 
 torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
 
 ddp = int(os.environ.get('RANK', -1)) != -1 # check whether using ddp
 if ddp:
@@ -50,9 +53,15 @@ if ddp:
 
 EPOCHS = 1
 BATCH_SIZE = 512
-MINI_BATCH_SIZE = 16 # we use gradient accumulation here.
+MINI_BATCH_SIZE = 8 # we use gradient accumulation here.
 NUM_TOKENS = 1024
 MAX_STEPS = 50
+VAL_FREQUENCY = 200
+SAMPLE_FREQUENCY = 20
+sample_start = "I am a large language model. "
+sample_start_tokens = encoder.encode(sample_start)
+sample_start_tokens = np.array(sample_start_tokens, dtype=np.uint16)
+sample_start_tokens = torch.tensor(sample_start_tokens, device=device).unsqueeze(0)
 assert BATCH_SIZE % (MINI_BATCH_SIZE * ddp_world_size ) == 0
 GRAD_ACCUM_STEPS = BATCH_SIZE // (MINI_BATCH_SIZE * ddp_world_size)
 if is_main_process:
@@ -85,10 +94,11 @@ class Dataloader:
                     self.curr_index = len(self.curr_shard_tokens) # this will end the loop next time 
                 else:
                     self.reset()
-                    raise StopIteration 
-            self.curr_shard = np.load(os.path.join(self.shards_path, f"{self.shard_files[self.curr_shard_idx]}"))
-            tokens = np.concatenate(tokens, self.curr_shard[:(batch_token_size - len(tokens))], axis=0) 
-            self.curr_index = batch_token_size - len(tokens) - 1
+                    raise StopIteration
+            else:
+                self.curr_shard = np.load(os.path.join(self.shards_path, f"{self.shard_files[self.curr_shard_idx]}"))
+                tokens = np.concatenate(tokens, self.curr_shard[:(batch_token_size - len(tokens))], axis=0) 
+                self.curr_index = batch_token_size - len(tokens) - 1
         else:
             self.curr_index += batch_token_size - 1
         curr_device_batch_size = self.batch_size * self.num_tokens
@@ -117,8 +127,8 @@ NUM_TOKEN_TOTAL = int(1e10)
 NUM_BATCHES = NUM_TOKEN_TOTAL // (BATCH_SIZE * NUM_TOKENS)
 if is_main_process:
     print(f"Number of steps: {NUM_BATCHES}")
-data_loader = Dataloader(FINEWEB_PATH, MINI_BATCH_SIZE, NUM_TOKENS, eot)
-NUM_BATCHES = 50
+train_data_loader = Dataloader(FINEWEB_PATH, MINI_BATCH_SIZE, NUM_TOKENS, eot)
+val_data_loader = Dataloader(FINEWEB_PATH, MINI_BATCH_SIZE, NUM_TOKENS, eot, split="val")
 
 # loss and optimizer
 loss = CrossEntropyLoss()
@@ -153,10 +163,39 @@ lr = 0
 for epoch in range(EPOCHS):
     if is_main_process:
         print(f"Epoch: {epoch}")
-    data_loader_iterator = iter(data_loader)
+    train_data_loader_iterator = iter(train_data_loader)
     for step in range(NUM_BATCHES):
+        model.eval()
         if step >= MAX_STEPS:
             break
+        with torch.no_grad():
+            if step % VAL_FREQUENCY == 0:
+                val_data_loader.reset()
+                val_data_loader_iterator = iter(val_data_loader)
+                val_loss_scalar = 0.0
+                num_val_batches = 0
+                for _ in range(20):
+                    x,y = next(val_data_loader_iterator)
+                    x = x.to(device)
+                    y = y.to(device)
+                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                        logits = model(x)
+                        loss_value = loss(logits.view(logits.shape[0] * logits.shape[1], logits.shape[-1]), y.view(y.shape[-1] * y.shape[-2]))
+                        val_loss_scalar += loss_value
+                    num_val_batches += 1
+                val_loss_scalar /= num_val_batches
+                if ddp:
+                    dist.all_reduce(val_loss_scalar, op=dist.ReduceOp.AVG)
+                val_loss_scalar = val_loss_scalar.item()
+                if is_main_process:
+                    print(f"Validation loss: {val_loss_scalar:.4f} at step {step}")
+            if step % SAMPLE_FREQUENCY == 0:
+                if is_main_process:
+                    x = x.to(device)
+                    logits = model(x)
+                    
+
+        model.train()
         st = time.time()
         # forward pass
         loss_scalar = 0.0
@@ -165,7 +204,7 @@ for epoch in range(EPOCHS):
         optimizer.zero_grad()
         for mini_step in range(GRAD_ACCUM_STEPS):
             try:
-                x, y = next(data_loader_iterator)
+                x, y = next(train_data_loader_iterator)
             except StopIteration:
                 pass  # end of iterator. looping back to start
             x = x.to(device)
