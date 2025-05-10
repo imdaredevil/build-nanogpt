@@ -55,13 +55,13 @@ if ddp:
 
 
 EPOCHS = 1
-BATCH_SIZE = 16
+BATCH_SIZE = 64
 MINI_BATCH_SIZE = 4 # we use gradient accumulation here.
 NUM_TOKENS = 128
-MAX_STEPS = 50
+MAX_STEPS = 1230000
 VAL_STEPS = 20
-VAL_FREQUENCY = 200
-SAMPLE_FREQUENCY = 20
+VAL_FREQUENCY = 50
+SAMPLE_FREQUENCY = 1000
 sample_start = "I am a large language model. "
 sample_start_tokens = encoder.encode(sample_start)
 sample_start_tokens = np.array(sample_start_tokens, dtype=np.int32)
@@ -69,9 +69,10 @@ sample_start_tokens = torch.tensor(sample_start_tokens, device=device)
 NUM_SAMPLES = 5
 sample_start_tokens = torch.stack([ sample_start_tokens for _ in range(NUM_SAMPLES)], dim=0)
 MAX_SAMPLE_LENGTH = 20
-SAVE_FREQUENCY = 20
+SAVE_FREQUENCY = 200
 CHECKPOINT_DIR = "./checkpoints"
-LOG_FREQUENCY = 10
+LOG_FREQUENCY = 500
+PRINT_FREQUENCY = 20
 LOG_FILE = "./train.log"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 assert BATCH_SIZE % (MINI_BATCH_SIZE * ddp_world_size ) == 0
@@ -131,11 +132,13 @@ class Dataloader:
 
 # TINY_SHAKESPEARE_PATH = "data/tiny_shakespeare.txt"
 # data_loader = Dataloader(TINY_SHAKESPEARE_PATH, MINI_BATCH_SIZE, NUM_TOKENS, encoder)
+# train_data_loader = data_loader
+# val_data_loader = data_loader
 # print(f"Number of mini-batches: {len(data_loader)}")
 # NUM_BATCHES = 50 # len(data_loader) // GRAD_ACCUM_STEPS
 # print(f"Number of batches: {NUM_BATCHES}")
 
-FINEWEB_PATH = "data/fineweb/"
+FINEWEB_PATH = "./fineweb/"
 NUM_TOKEN_TOTAL = int(1e10)
 NUM_BATCHES = NUM_TOKEN_TOTAL // (BATCH_SIZE * NUM_TOKENS)
 if is_main_process:
@@ -177,13 +180,13 @@ def val_model():
         val_data_loader_iterator = iter(val_data_loader)
         val_loss_scalar = 0.0
         num_val_batches = 0
-        for _ in range(20):
+        for _ in range(VAL_STEPS):
             x, y = next(val_data_loader_iterator)
             x = x.to(device)
             y = y.to(device)
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                 logits = model(x)
-                loss_value = loss(logits.view(logits.shape[0] * logits.shape[1], logits.shape[-1]), y.view(y.shape[-1] * y.shape[-2]))
+                loss_value = loss(logits.view(logits.shape[0] * logits.shape[1], logits.shape[-1]), y.view(y.shape[-1] * y.shape[-2]).to(torch.long))
                 val_loss_scalar += loss_value
             num_val_batches += 1
         val_loss_scalar /= num_val_batches
@@ -272,7 +275,7 @@ for epoch in range(EPOCHS):
                 model.require_backward_grad_sync = (mini_step == GRAD_ACCUM_STEPS - 1)# sync gradients only in the last mini step
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                 logits = model(x)
-                loss_value = loss(logits.view(logits.shape[0] * logits.shape[1], logits.shape[-1]), y.view(y.shape[-1] * y.shape[-2]))
+                loss_value = loss(logits.view(logits.shape[0] * logits.shape[1], logits.shape[-1]), y.view(y.shape[-1] * y.shape[-2]).to(torch.long))
                 loss_value /= GRAD_ACCUM_STEPS
             # backward pass
             loss_value.backward()
@@ -289,15 +292,12 @@ for epoch in range(EPOCHS):
             torch.cuda.synchronize()
         end = time.time()
         time_taken = end - st
-        if is_main_process:
+        if is_main_process and (step % PRINT_FREQUENCY == 0 or step == NUM_BATCHES - 1):
             log_str = f"Step: {step}, loss: {loss_scalar.item():.4f}, norm: {norm:.4f}, lr: {lr:.4e}, time taken: {time_taken * 1000:.4f} ms, tokens per second: {(BATCH_SIZE * NUM_TOKENS/time_taken):.4f}"
             logs.append(log_str)
             print(log_str)
             train_losses.append(loss_scalar.item())
             val_losses.append(val_loss_scalar.item())
-
-if ddp:
-    destroy_process_group()
 
 # final validation
 val_loss_scalar = val_model()
@@ -316,6 +316,9 @@ if is_main_process:
 # save model
 if is_main_process:
     torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/model.pt")
+
+if ddp:
+    destroy_process_group()
 
 # save logs
 with open(LOG_FILE, "a") as f:

@@ -1,0 +1,8 @@
+torch
+tiktoken
+numpy
+pandas
+matplotlib
+transformers
+pyarrow
+fastparquet
