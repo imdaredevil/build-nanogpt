@@ -55,13 +55,13 @@ if ddp:
 
 
 EPOCHS = 1
-BATCH_SIZE = 64
-MINI_BATCH_SIZE = 4 # we use gradient accumulation here.
-NUM_TOKENS = 128
+BATCH_SIZE = 1024
+MINI_BATCH_SIZE = 64 # we use gradient accumulation here.
+NUM_TOKENS = 1024
 MAX_STEPS = 1230000
 VAL_STEPS = 20
 VAL_FREQUENCY = 50
-SAMPLE_FREQUENCY = 1000
+SAMPLE_FREQUENCY = 100
 sample_start = "I am a large language model. "
 sample_start_tokens = encoder.encode(sample_start)
 sample_start_tokens = np.array(sample_start_tokens, dtype=np.int32)
@@ -69,10 +69,10 @@ sample_start_tokens = torch.tensor(sample_start_tokens, device=device)
 NUM_SAMPLES = 5
 sample_start_tokens = torch.stack([ sample_start_tokens for _ in range(NUM_SAMPLES)], dim=0)
 MAX_SAMPLE_LENGTH = 20
-SAVE_FREQUENCY = 200
+SAVE_FREQUENCY = 100
 CHECKPOINT_DIR = "./checkpoints"
-LOG_FREQUENCY = 500
-PRINT_FREQUENCY = 20
+LOG_FREQUENCY = 250
+PRINT_FREQUENCY = 10
 LOG_FILE = "./train.log"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 assert BATCH_SIZE % (MINI_BATCH_SIZE * ddp_world_size ) == 0
