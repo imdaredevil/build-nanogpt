@@ -102,7 +102,7 @@ class Dataloader:
         if len(tokens) < batch_token_size: # need to fetch from next shard
             self.curr_shard_idx = (self.curr_shard_idx + 1) % len(self.shard_files)
             self.curr_shard_tokens = np.load(os.path.join(self.shards_path, f"{self.shard_files[self.curr_shard_idx]}"))
-            tokens = np.concatenate([tokens, self.curr_shard[:(batch_token_size - len(tokens))]], axis=0) 
+            tokens = np.concatenate([tokens, self.curr_shard_tokens[:(batch_token_size - len(tokens))]], axis=0) 
             self.curr_index = batch_token_size - len(tokens) - 1
         else:
             self.curr_index += batch_token_size - 1
