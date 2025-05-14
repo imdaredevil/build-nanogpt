@@ -55,8 +55,8 @@ if ddp:
 
 
 EPOCHS = 1
-BATCH_SIZE = 1024
-MINI_BATCH_SIZE = 64 # we use gradient accumulation here.
+BATCH_SIZE = 256
+MINI_BATCH_SIZE = 16 # we use gradient accumulation here.
 NUM_TOKENS = 1024
 MAX_STEPS = 1230000
 VAL_STEPS = 20
@@ -100,19 +100,10 @@ class Dataloader:
         tokens = self.curr_shard_tokens[self.curr_index : self.curr_index + batch_token_size]
 
         if len(tokens) < batch_token_size: # need to fetch from next shard
-            self.curr_shard_idx += 1
-            if self.curr_shard_idx >= len(self.shard_files): # reached end of all shards
-                if len(tokens) > 0: # return what we have after padding
-                    tokens = np.pad(tokens, batch_token_size - len(tokens), mode="constant", constant_values=self.pad_token)
-                    # move curr_idx to end
-                    self.curr_index = len(self.curr_shard_tokens) # this will end the loop next time 
-                else:
-                    self.reset()
-                    raise StopIteration
-            else:
-                self.curr_shard = np.load(os.path.join(self.shards_path, f"{self.shard_files[self.curr_shard_idx]}"))
-                tokens = np.concatenate(tokens, self.curr_shard[:(batch_token_size - len(tokens))], axis=0) 
-                self.curr_index = batch_token_size - len(tokens) - 1
+            self.curr_shard_idx = (self.curr_shard_idx + 1) % len(self.shard_files)
+            self.curr_shard_tokens = np.load(os.path.join(self.shards_path, f"{self.shard_files[self.curr_shard_idx]}"))
+            tokens = np.concatenate([tokens, self.curr_shard[:(batch_token_size - len(tokens))]], axis=0) 
+            self.curr_index = batch_token_size - len(tokens) - 1
         else:
             self.curr_index += batch_token_size - 1
         curr_device_batch_size = self.batch_size * self.num_tokens
@@ -138,7 +129,7 @@ class Dataloader:
 # NUM_BATCHES = 50 # len(data_loader) // GRAD_ACCUM_STEPS
 # print(f"Number of batches: {NUM_BATCHES}")
 
-FINEWEB_PATH = "./fineweb/"
+FINEWEB_PATH = "./data/fineweb/"
 NUM_TOKEN_TOTAL = int(1e10)
 NUM_BATCHES = NUM_TOKEN_TOTAL // (BATCH_SIZE * NUM_TOKENS)
 if is_main_process:
