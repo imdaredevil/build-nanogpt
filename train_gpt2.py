@@ -54,8 +54,8 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
 
-EPOCHS = 1
-BATCH_SIZE = 256
+EPOCHS = 3
+BATCH_SIZE = 512
 MINI_BATCH_SIZE = 16 # we use gradient accumulation here.
 NUM_TOKENS = 1024
 MAX_STEPS = 1230000
@@ -70,10 +70,10 @@ NUM_SAMPLES = 5
 sample_start_tokens = torch.stack([ sample_start_tokens for _ in range(NUM_SAMPLES)], dim=0)
 MAX_SAMPLE_LENGTH = 20
 SAVE_FREQUENCY = 100
-CHECKPOINT_DIR = "./checkpoints"
+CHECKPOINT_DIR = "/home/ubuntu/data/build-nanogpt/checkpoints"
 LOG_FREQUENCY = 250
 PRINT_FREQUENCY = 10
-LOG_FILE = "./train.log"
+LOG_FILE = "/home/ubuntu/data/build-nanogpt/train.log"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 assert BATCH_SIZE % (MINI_BATCH_SIZE * ddp_world_size ) == 0
 GRAD_ACCUM_STEPS = BATCH_SIZE // (MINI_BATCH_SIZE * ddp_world_size)
@@ -97,15 +97,15 @@ class Dataloader:
 
     def __next__(self):
         batch_token_size = self.batch_size * self.num_tokens * ddp_world_size + 1
+
         tokens = self.curr_shard_tokens[self.curr_index : self.curr_index + batch_token_size]
 
         if len(tokens) < batch_token_size: # need to fetch from next shard
             self.curr_shard_idx = (self.curr_shard_idx + 1) % len(self.shard_files)
             self.curr_shard_tokens = np.load(os.path.join(self.shards_path, f"{self.shard_files[self.curr_shard_idx]}"))
-            tokens = np.concatenate([tokens, self.curr_shard_tokens[:(batch_token_size - len(tokens))]], axis=0) 
-            self.curr_index = batch_token_size - len(tokens) - 1
-        else:
-            self.curr_index += batch_token_size - 1
+            self.curr_index = 0
+            tokens = self.curr_shard_tokens[self.curr_index : self.curr_index + batch_token_size]
+        self.curr_index += batch_token_size - 1
         curr_device_batch_size = self.batch_size * self.num_tokens
         tokens = tokens[ddp_local_rank * curr_device_batch_size:((ddp_local_rank + 1) * curr_device_batch_size + 1)]
         x = tokens[:-1]
@@ -129,7 +129,7 @@ class Dataloader:
 # NUM_BATCHES = 50 # len(data_loader) // GRAD_ACCUM_STEPS
 # print(f"Number of batches: {NUM_BATCHES}")
 
-FINEWEB_PATH = "./data/fineweb/"
+FINEWEB_PATH = "/home/ubuntu/data/build-nanogpt/fineweb/"
 NUM_TOKEN_TOTAL = int(1e10)
 NUM_BATCHES = NUM_TOKEN_TOTAL // (BATCH_SIZE * NUM_TOKENS)
 if is_main_process:
@@ -158,8 +158,10 @@ def get_lr(curr_lr, step):
     elif step < COSINE_DECAY_STEPS:
         step_no = step - WARMUP_STEPS
         total_steps = COSINE_DECAY_STEPS - WARMUP_STEPS
-        cos_value = np.cos((step_no / total_steps) * np.pi) * 0.5 + 0.5 # scaling cos to given value
-        return MIN_LR + 0.9 * MAX_LR * cos_value
+        # cos_value = np.cos((step_no / total_steps) * np.pi) * 0.5 + 0.5 # scaling cos to given value
+        # return MIN_LR + 0.9 * MAX_LR * cos_value
+        # lets implement linear decay
+        return MIN_LR + (MAX_LR - MIN_LR) * (1 - (step_no / total_steps))
     else:
         return MIN_LR
 
@@ -208,6 +210,17 @@ def sample_model():
                 sample_sentences.append(encoder.decode(curr_sample_start_tokens[i].cpu().numpy().tolist()))
     return sample_sentences
 
+
+# CHECKPOINT_STEP = 9000
+# model.load_state_dict(
+#     torch.load(
+#         f"{CHECKPOINT_DIR}/model_{CHECKPOINT_STEP}.pt", 
+#         map_location=device
+#     )
+# )
+
+
+TOTAL_BATCHES = NUM_BATCHES * EPOCHS
 # training loop
 lr = 0
 logs = []
@@ -215,80 +228,90 @@ train_losses = []
 val_losses = []
 f = open(LOG_FILE, "w")
 f.close()
-for epoch in range(EPOCHS):
-    if is_main_process:
-        print(f"Epoch: {epoch}")
-    train_data_loader_iterator = iter(train_data_loader)
-    for step in range(NUM_BATCHES):
-        model.eval()
-        if step >= MAX_STEPS:
-            break
-        if step % VAL_FREQUENCY == 0:
-            val_loss_scalar = val_model()
-            if is_main_process:
-                log_str = f"Validation loss: {val_loss_scalar:.4f} at step {step}"
-                logs.append(log_str)
-                print(log_str)
-        if step % SAMPLE_FREQUENCY == 0:
-            if is_main_process:
-                print(f"Sampling at step {step}")
-                samples = sample_model()
-                for sample in samples:
-                    print(sample)
-        if step % SAVE_FREQUENCY == 0:
-            if is_main_process:
-                torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/model_{step}.pt")
-        if step % LOG_FREQUENCY == 0:
-            if is_main_process:
-                with open(LOG_FILE, "a") as f:
-                    f.write("\n".join(logs))
-                logs = []
-                plt.figure()
-                plt.plot(train_losses)
-                plt.plot(val_losses)
-                plt.legend(["train", "val"])
-                plt.savefig(f"{CHECKPOINT_DIR}/losses_{step}.png")
-        model.train()
-        st = time.time()
-        # forward pass
-        loss_scalar = 0.0
-        lr = get_lr(lr, step)
-        optimizer.param_groups[0]["lr"] = lr
-        optimizer.zero_grad()
-        for mini_step in range(GRAD_ACCUM_STEPS):
-            try:
-                x, y = next(train_data_loader_iterator)
-            except StopIteration:
-                pass  # end of iterator. looping back to start
-            x = x.to(device)
-            y = y.to(device)
-            if ddp:
-                model.require_backward_grad_sync = (mini_step == GRAD_ACCUM_STEPS - 1)# sync gradients only in the last mini step
-            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                logits = model(x)
-                loss_value = loss(logits.view(logits.shape[0] * logits.shape[1], logits.shape[-1]), y.view(y.shape[-1] * y.shape[-2]).to(torch.long))
-                loss_value /= GRAD_ACCUM_STEPS
-            # backward pass
-            loss_value.backward()
-            loss_scalar += loss_value
-        if ddp:
-            dist.all_reduce(loss_scalar, op=dist.ReduceOp.AVG)
-
-        # clip gradients
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        if device == "mps":
-            torch.mps.synchronize()
-        if device == "cuda":
-            torch.cuda.synchronize()
-        end = time.time()
-        time_taken = end - st
-        if is_main_process and (step % PRINT_FREQUENCY == 0 or step == NUM_BATCHES - 1):
-            log_str = f"Step: {step}, loss: {loss_scalar.item():.4f}, norm: {norm:.4f}, lr: {lr:.4e}, time taken: {time_taken * 1000:.4f} ms, tokens per second: {(BATCH_SIZE * NUM_TOKENS/time_taken):.4f}"
+# for epoch in range(EPOCHS):
+#     if is_main_process:
+#         print(f"Epoch: {epoch}")
+train_data_loader_iterator = iter(train_data_loader)
+for step in range(TOTAL_BATCHES):
+    model.eval()
+    # if step <= CHECKPOINT_STEP:
+    #     next(train_data_loader_iterator)
+    #     continue
+    if step >= MAX_STEPS:
+        break
+    if step % VAL_FREQUENCY == 0:
+        val_loss_scalar = val_model()
+        if is_main_process:
+            log_str = f"Validation loss: {val_loss_scalar:.4f} at step {step}"
             logs.append(log_str)
             print(log_str)
-            train_losses.append(loss_scalar.item())
-            val_losses.append(val_loss_scalar.item())
+            val_losses.append((step, val_loss_scalar.item()))
+    if step % SAMPLE_FREQUENCY == 0:
+        if is_main_process:
+            print(f"Sampling at step {step}")
+            samples = sample_model()
+            for sample in samples:
+                print(sample)
+    if step % SAVE_FREQUENCY == 0:
+        if is_main_process:
+            torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/model_{step}.pt")
+    if step % LOG_FREQUENCY == 0:
+        if is_main_process:
+            with open(LOG_FILE, "a") as f:
+                f.write("\n".join(logs))
+            logs = []
+            plt.figure()
+            if len(train_losses) > 0:
+                train_loss_x, train_loss_y = zip(*train_losses)
+                plt.plot(train_loss_x, train_loss_y)
+            if len(val_losses) > 0:
+                val_loss_x, val_loss_y = zip(*val_losses)
+                plt.plot(val_loss_x, val_loss_y)
+            if (len(val_losses) > 0) and (len(train_losses) > 0):
+                plt.legend(["train", "val"])
+            plt.savefig(f"{CHECKPOINT_DIR}/losses_{step}.png")
+    model.train()
+    st = time.time()
+    # forward pass
+    loss_scalar = 0.0
+    lr = get_lr(lr, step)
+    optimizer.param_groups[0]["lr"] = lr
+    optimizer.zero_grad()
+    for mini_step in range(GRAD_ACCUM_STEPS):
+        try:
+            x, y = next(train_data_loader_iterator)
+        except StopIteration:
+            # train_data_loader_iterator = iter(train_data_loader)
+            pass  # end of iterator. looping back to start
+        x = x.to(device)
+        y = y.to(device)
+        if ddp:
+            model.require_backward_grad_sync = (mini_step == GRAD_ACCUM_STEPS - 1)# sync gradients only in the last mini step
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            logits = model(x)
+            loss_value = loss(logits.view(logits.shape[0] * logits.shape[1], logits.shape[-1]), y.view(y.shape[-1] * y.shape[-2]).to(torch.long))
+            loss_value /= GRAD_ACCUM_STEPS
+        # backward pass
+        loss_value.backward()
+        loss_scalar += loss_value
+    if ddp:
+        dist.all_reduce(loss_scalar, op=dist.ReduceOp.AVG)
+
+    # clip gradients
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    optimizer.step()
+    if device == "mps":
+        torch.mps.synchronize()
+    if device == "cuda":
+        torch.cuda.synchronize()
+    end = time.time()
+    time_taken = end - st
+    if is_main_process and (step % PRINT_FREQUENCY == 0 or step == NUM_BATCHES - 1):
+        log_str = f"Step: {step}, loss: {loss_scalar.item():.4f}, norm: {norm:.4f}, lr: {lr:.4e}, time taken: {time_taken * 1000:.4f} ms, tokens per second: {(BATCH_SIZE * NUM_TOKENS/time_taken):.4f}"
+        logs.append(log_str)
+        print(log_str)
+    if is_main_process:
+        train_losses.append((step, loss_scalar.item()))
 
 # final validation
 val_loss_scalar = val_model()
@@ -296,7 +319,7 @@ if is_main_process:
     log_str = f"Final validation loss: {val_loss_scalar:.4f}"
     logs.append(log_str)
     print(log_str)
-    val_losses.append(val_loss_scalar.item())
+    val_losses.append((MAX_STEPS, val_loss_scalar.item()))
 
 # final sample
 if is_main_process:
